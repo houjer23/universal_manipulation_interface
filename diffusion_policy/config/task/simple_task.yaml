@@ -1,0 +1,17 @@
+name: simple_task
+
+obs_dim: 7  # 3 (eef_pos) + 3 (eef_rot) + 1 (gripper_width)
+action_dim: 7  # 3 (eef_pos) + 3 (eef_rot) + 1 (gripper_width)
+keypoint_dim: 2
+
+dataset:
+  _target_: diffusion_policy.dataset.simple_task_lowdim_dataset.SimpleTaskLowdimDataset
+  dataset_path: /home/sulab1/Workspace/jerry/diffusion/data/simple_task.zarr.zip
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: 15  # Fixed to make total 32 (divisible by 8 for UNet)
+  seed: 42
+  val_ratio: 0.1
+
+env_runner: null  # No environment for real robot offline training
+
