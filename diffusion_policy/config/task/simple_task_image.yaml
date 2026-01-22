@@ -1,0 +1,35 @@
+name: simple_task_image
+
+image_shape: [3, 224, 224]  # C, H, W (224x224 for ViT)
+
+# Observation horizons
+img_obs_horizon: 2    # I-To: image observation horizon
+prop_obs_horizon: 2   # P-To: proprioception observation horizon
+action_horizon: 8     # Ta: action horizon (must be divisible by 8 for U-Net)
+
+shape_meta: &shape_meta
+  obs:
+    camera0_rgb:
+      shape: ${task.image_shape}
+      horizon: ${task.img_obs_horizon}
+      type: rgb
+    robot0_joint_positions:
+      shape: [3]
+      horizon: ${task.prop_obs_horizon}
+      type: low_dim
+  action: 
+    shape: [3]
+    horizon: ${task.action_horizon}
+
+dataset:
+  _target_: diffusion_policy.dataset.simple_task_image_dataset.SimpleTaskImageDataset
+  shape_meta: *shape_meta
+  dataset_path: /home/sulab1/Workspace/jerry/diffusion/data/camera_dataset2.zarr.zip
+  horizon: ${task.action_horizon}
+  pad_before: ${eval:'${task.img_obs_horizon}-1'}
+  pad_after: ${eval:'${task.action_horizon}-${task.img_obs_horizon}'}
+  n_obs_steps: ${task.img_obs_horizon}
+  seed: 42
+  val_ratio: 0.1
+
+env_runner: null  # No environment for real robot offline training

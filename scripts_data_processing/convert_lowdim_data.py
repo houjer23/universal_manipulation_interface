@@ -2,6 +2,8 @@
 """
 Convert lowdim data to replay buffer format (no camera data)
 Usage: python convert_lowdim_data.py <collections_dir> <output_path>
+
+python convert_lowdim_data.py /home/sulab1/Workspace/jerry/diffusion/data/collections /home/sulab1/Workspace/jerry/diffusion/data/joint_positions_dataset.zarr.zip
 """
 
 import sys
@@ -12,6 +14,9 @@ import numpy as np
 import json
 from tqdm import tqdm
 from numcodecs import Zstd
+
+# Add the parent directory to the Python path to find diffusion_policy
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from diffusion_policy.common.replay_buffer import ReplayBuffer
 
 
@@ -75,49 +80,15 @@ def main():
     for episode_path in tqdm(episodes, desc="Processing episodes"):
         try:
             # Read data using manual zarr v3 reader
-            commands = read_zarr_v3_array(episode_path / 'commands')  # (T, 2)
             cur_joint_qpos = read_zarr_v3_array(episode_path / 'cur_joint_qpos')  # (T, N)
             
-            T = commands.shape[0]
+            T, num_joints = cur_joint_qpos.shape
             
-            # For UMI format, we need:
-            # robot0_eef_pos: (T, 3) - end effector position
-            # robot0_eef_rot_axis_angle: (T, 3) - rotation as axis-angle
-            # robot0_gripper_width: (T, 1) - gripper width
-            
-            # Since your data has 2D commands, we'll create dummy 3D data
-            # Adjust this based on your actual robot configuration
+            # Simply use the joint positions as the data
             episode_data = {}
             
-            # If commands are 2D (e.g., x, y positions), expand to 3D
-            if commands.shape[1] == 2:
-                eef_pos = np.zeros((T, 3), dtype=np.float32)
-                eef_pos[:, :2] = commands  # x, y from commands
-                eef_pos[:, 2] = 0.0  # z = 0
-            else:
-                eef_pos = commands[:, :3].astype(np.float32)
-            
-            # Dummy rotation (no rotation)
-            eef_rot = np.zeros((T, 3), dtype=np.float32)
-            
-            # Dummy gripper width (always open, 0.08m)
-            gripper_width = np.full((T, 1), 0.08, dtype=np.float32)
-            
-            episode_data['robot0_eef_pos'] = eef_pos
-            episode_data['robot0_eef_rot_axis_angle'] = eef_rot
-            episode_data['robot0_gripper_width'] = gripper_width
-            
-            # Add demo start/end poses (same as first/last poses)
-            demo_start_pose = np.zeros((T, 6), dtype=np.float32)
-            demo_start_pose[:, :3] = eef_pos[0]
-            demo_start_pose[:, 3:] = eef_rot[0]
-            
-            demo_end_pose = np.zeros((T, 6), dtype=np.float32)
-            demo_end_pose[:, :3] = eef_pos[-1]
-            demo_end_pose[:, 3:] = eef_rot[-1]
-            
-            episode_data['robot0_demo_start_pose'] = demo_start_pose
-            episode_data['robot0_demo_end_pose'] = demo_end_pose
+            # Use cur_joint_qpos directly as the robot state
+            episode_data['robot0_joint_positions'] = cur_joint_qpos.astype(np.float32)
             
             # Add episode to replay buffer
             out_replay_buffer.add_episode(data=episode_data, compressors=None)

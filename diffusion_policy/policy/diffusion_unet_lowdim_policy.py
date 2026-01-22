@@ -1,9 +1,10 @@
 from typing import Dict
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, reduce
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
@@ -13,7 +14,7 @@ from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
     def __init__(self, 
             model: ConditionalUnet1D,
-            noise_scheduler: DDPMScheduler,
+            noise_scheduler: DDIMScheduler,
             horizon, 
             obs_dim, 
             action_dim, 
@@ -75,13 +76,18 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
 
-        for t in scheduler.timesteps:
+        unet_forward_times = []
+        
+        for i, t in enumerate(scheduler.timesteps):
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
+            step_start = time.time()
             model_output = model(trajectory, t, 
                 local_cond=local_cond, global_cond=global_cond)
+            step_time = time.time() - step_start
+            unet_forward_times.append(step_time)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory = scheduler.step(
@@ -89,6 +95,16 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
                 generator=generator,
                 **kwargs
                 ).prev_sample
+            
+            # Print timing for first, middle, and last steps
+            if i == 0:
+                print(f"  [U-Net] Step 1/{self.num_inference_steps}: {step_time*1000:.2f} ms")
+            elif i == self.num_inference_steps // 2:
+                print(f"  [U-Net] Step {i+1}/{self.num_inference_steps}: {step_time*1000:.2f} ms")
+            elif i == self.num_inference_steps - 1:
+                print(f"  [U-Net] Step {i+1}/{self.num_inference_steps}: {step_time*1000:.2f} ms")
+                avg_time = sum(unet_forward_times) / len(unet_forward_times)
+                print(f"  [U-Net] Average per step: {avg_time*1000:.2f} ms")
         
         # finally make sure conditioning is enforced
         trajectory[condition_mask] = condition_data[condition_mask]        
@@ -104,7 +120,12 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
 
         assert 'obs' in obs_dict
         assert 'past_action' not in obs_dict # not implemented yet
+        
+        # Time normalization
+        norm_start = time.time()
         nobs = self.normalizer['obs'].normalize(obs_dict['obs'])
+        norm_time = time.time() - norm_start
+        
         B, _, Do = nobs.shape
         To = self.n_obs_steps
         assert Do == self.obs_dim
@@ -143,16 +164,24 @@ class DiffusionUnetLowdimPolicy(BaseLowdimPolicy):
             cond_mask[:,:To,Da:] = True
 
         # run sampling
+        unet_start = time.time()
         nsample = self.conditional_sample(
             cond_data, 
             cond_mask,
             local_cond=local_cond,
             global_cond=global_cond,
             **self.kwargs)
+        unet_time = time.time() - unet_start
         
         # unnormalize prediction
+        unnorm_start = time.time()
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        unnorm_time = time.time() - unnorm_start
+        
+        # Print timing breakdown
+        total_time = norm_time + unet_time + unnorm_time
+        print(f"[Timing] Normalize: {norm_time*1000:.2f} ms | U-Net ({self.num_inference_steps} steps): {unet_time*1000:.2f} ms | Unnormalize: {unnorm_time*1000:.2f} ms | Total: {total_time*1000:.2f} ms")
 
         # get action
         if self.pred_action_steps_only:

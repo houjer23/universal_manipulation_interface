@@ -1,5 +1,6 @@
 from typing import Union
 import logging
+import time
 import torch
 import torch.nn as nn
 import einops
@@ -165,6 +166,9 @@ class ConditionalUnet1D(nn.Module):
         self.up_modules = up_modules
         self.down_modules = down_modules
         self.final_conv = final_conv
+        
+        # Flag to track if we've printed detailed timing
+        self._printed_detailed_timing = False
 
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
@@ -181,9 +185,18 @@ class ConditionalUnet1D(nn.Module):
         global_cond: (B,global_cond_dim)
         output: (B,T,input_dim)
         """
+        # Time each major component (only print once)
+        print_timing = not self._printed_detailed_timing
+        
+        if print_timing:
+            start_total = time.time()
+        
         sample = einops.rearrange(sample, 'b h t -> b t h')
 
         # 1. time
+        if print_timing:
+            t_start = time.time()
+            
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
@@ -200,6 +213,9 @@ class ConditionalUnet1D(nn.Module):
                 global_feature, global_cond
             ], axis=-1)
         
+        if print_timing:
+            time_encode_time = time.time() - t_start
+        
         # encode local features
         h_local = list()
         if local_cond is not None:
@@ -210,6 +226,10 @@ class ConditionalUnet1D(nn.Module):
             x = resnet2(local_cond, global_feature)
             h_local.append(x)
         
+        # Downsample path
+        if print_timing:
+            down_start = time.time()
+            
         x = sample
         h = []
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
@@ -220,9 +240,19 @@ class ConditionalUnet1D(nn.Module):
             h.append(x)
             x = downsample(x)
 
+        if print_timing:
+            down_time = time.time() - down_start
+            mid_start = time.time()
+
+        # Middle blocks
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
 
+        if print_timing:
+            mid_time = time.time() - mid_start
+            up_start = time.time()
+
+        # Upsample path
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
             x = torch.cat((x, h.pop()), dim=1)
             x = resnet(x, global_feature)
@@ -231,8 +261,27 @@ class ConditionalUnet1D(nn.Module):
             x = resnet2(x, global_feature)
             x = upsample(x)
 
+        if print_timing:
+            up_time = time.time() - up_start
+            final_start = time.time()
+
         x = self.final_conv(x)
 
         x = einops.rearrange(x, 'b t h -> b h t')
+        
+        if print_timing:
+            final_time = time.time() - final_start
+            total_time = time.time() - start_total
+            
+            print(f"    [U-Net Breakdown - First Step]")
+            print(f"      Time encoding:  {time_encode_time*1000:.3f} ms ({time_encode_time/total_time*100:.1f}%)")
+            print(f"      Down path:      {down_time*1000:.3f} ms ({down_time/total_time*100:.1f}%)")
+            print(f"      Middle blocks:  {mid_time*1000:.3f} ms ({mid_time/total_time*100:.1f}%)")
+            print(f"      Up path:        {up_time*1000:.3f} ms ({up_time/total_time*100:.1f}%)")
+            print(f"      Final conv:     {final_time*1000:.3f} ms ({final_time/total_time*100:.1f}%)")
+            print(f"      Total:          {total_time*1000:.3f} ms")
+            
+            self._printed_detailed_timing = True
+        
         return x
 

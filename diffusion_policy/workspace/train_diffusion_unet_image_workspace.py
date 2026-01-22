@@ -58,7 +58,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         #     cfg.optimizer, params=self.model.parameters())
 
         obs_encorder_lr = cfg.optimizer.lr
-        if cfg.policy.obs_encoder.pretrained:
+        if cfg.policy.obs_encoder.get('pretrained', False):
             obs_encorder_lr *= 0.1
             print('==> reduce pretrained obs_encorder\'s lr')
         obs_encorder_params = list()
@@ -152,12 +152,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 cfg.ema,
                 model=self.ema_model)
 
-        # configure env
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
+        # configure env (optional - can be None for offline training)
+        env_runner = None
+        if cfg.task.env_runner is not None:
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir)
+            assert isinstance(env_runner, BaseImageRunner)
 
         # # configure logging
         # wandb_run = wandb.init(
@@ -227,12 +228,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model(batch)
+                        raw_loss = self.model.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                            # Gradient clipping to prevent NaN from bad batches
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
@@ -274,8 +277,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     policy = self.ema_model
                 policy.eval()
 
-                # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                # run rollout (skip if no env_runner)
+                if env_runner is not None and (self.epoch % cfg.training.rollout_every) == 0:
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
@@ -299,27 +302,22 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 #             step_log['val_loss'] = val_loss
                 
                 def log_action_mse(step_log, category, pred_action, gt_action):
-                    B, T, _ = pred_action.shape
-                    pred_action = pred_action.view(B, T, -1, 10)
-                    gt_action = gt_action.view(B, T, -1, 10)
+                    # Simple MSE for all action dimensions
                     step_log[f'{category}_action_mse_error'] = torch.nn.functional.mse_loss(pred_action, gt_action)
-                    step_log[f'{category}_action_mse_error_pos'] = torch.nn.functional.mse_loss(pred_action[..., :3], gt_action[..., :3])
-                    step_log[f'{category}_action_mse_error_rot'] = torch.nn.functional.mse_loss(pred_action[..., 3:9], gt_action[..., 3:9])
-                    step_log[f'{category}_action_mse_error_width'] = torch.nn.functional.mse_loss(pred_action[..., 9], gt_action[..., 9])
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0 and accelerator.is_main_process:
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         gt_action = batch['action']
-                        pred_action = policy.predict_action(batch['obs'], None)['action_pred']
+                        pred_action = policy.predict_action(batch['obs'])['action_pred']
                         log_action_mse(step_log, 'train', pred_action, gt_action)
 
                         if len(val_dataloader) > 0:
                             val_sampling_batch = next(iter(val_dataloader))
                             batch = dict_apply(val_sampling_batch, lambda x: x.to(device, non_blocking=True))
                             gt_action = batch['action']
-                            pred_action = policy.predict_action(batch['obs'], None)['action_pred']
+                            pred_action = policy.predict_action(batch['obs'])['action_pred']
                             log_action_mse(step_log, 'val', pred_action, gt_action)
 
                         del batch

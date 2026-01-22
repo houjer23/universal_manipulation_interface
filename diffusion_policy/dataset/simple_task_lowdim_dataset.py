@@ -84,7 +84,7 @@ class SimpleTaskLowdimDataset(BaseLowdimDataset):
         
         # Extract data
         result = {}
-        for key in ['robot0_eef_pos', 'robot0_eef_rot_axis_angle', 'robot0_gripper_width']:
+        for key in ['robot0_joint_positions']:
             data = self.replay_buffer[key][seq_start:seq_end]
             
             # Pad after if needed to reach horizon length
@@ -98,14 +98,10 @@ class SimpleTaskLowdimDataset(BaseLowdimDataset):
         return result
 
     def _sample_to_data(self, sample):
-        # Concatenate robot0 observations - take first n_obs_steps
+        # Use joint positions directly as the data
         # For this simple lowdim case, obs and action use same data
         # but different slicing based on the architecture
-        full_seq = np.concatenate([
-            sample['robot0_eef_pos'],
-            sample['robot0_eef_rot_axis_angle'],
-            sample['robot0_gripper_width']
-        ], axis=-1)
+        full_seq = sample['robot0_joint_positions']
         
         # obs: typically observation history (not used much in lowdim)
         # action: the full sequence that will be processed by the policy
@@ -126,11 +122,8 @@ class SimpleTaskLowdimDataset(BaseLowdimDataset):
         obs_list = []
         action_list = []
         
-        # Use all data from replay buffer directly
-        for key in ['robot0_eef_pos', 'robot0_eef_rot_axis_angle', 'robot0_gripper_width']:
-            obs_list.append(self.replay_buffer[key][:])
-        
-        obs_array = np.concatenate(obs_list, axis=-1)
+        # Use joint positions data directly
+        obs_array = self.replay_buffer['robot0_joint_positions'][:]
         
         # Construct actions
         action_array = obs_array  # Actions are same as observations for simple task

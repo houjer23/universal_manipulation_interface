@@ -6,6 +6,7 @@ Usage: python test_model.py <checkpoint_path>
 
 import sys
 import os
+import time
 import torch
 import numpy as np
 from pathlib import Path
@@ -21,8 +22,27 @@ from diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace import Tra
 def test_checkpoint(checkpoint_path):
     print(f"Loading checkpoint: {checkpoint_path}")
     
+    # Set device to GPU 1
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Print GPU information
+    if torch.cuda.is_available():
+        gpu_id = 1
+        print(f"\nGPU Information:")
+        print(f"  GPU Name: {torch.cuda.get_device_name(gpu_id)}")
+        print(f"  CUDA Version: {torch.version.cuda}")
+        print(f"  Total GPU Memory: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.2f} GB")
+        print(f"  Available GPUs: {torch.cuda.device_count()}")
+        
+        # Memory info before loading model
+        torch.cuda.reset_peak_memory_stats(gpu_id)
+        print(f"  Current Memory Allocated: {torch.cuda.memory_allocated(gpu_id) / 1024**2:.2f} MB")
+        print(f"  Current Memory Reserved: {torch.cuda.memory_reserved(gpu_id) / 1024**2:.2f} MB")
+    print()
+    
     # Load checkpoint
-    payload = torch.load(checkpoint_path, map_location='cpu')
+    payload = torch.load(checkpoint_path, map_location=device)
     cfg = payload['cfg']
     
     # Create workspace and load checkpoint
@@ -31,6 +51,7 @@ def test_checkpoint(checkpoint_path):
     
     # Get the policy (use EMA model if available)
     policy = workspace.ema_model if workspace.ema_model is not None else workspace.model
+    policy.to(device)
     policy.eval()
     
     print(f"✓ Model loaded successfully!")
@@ -40,47 +61,68 @@ def test_checkpoint(checkpoint_path):
     print(f"  Epoch: {payload.get('epoch', 'unknown')}")
     print()
     
-    # Create test input (2 observation timesteps, 7 dims each)
-    # Format: [pos_x, pos_y, pos_z, rot_x, rot_y, rot_z, gripper_width]
+    # Create test input (2 observation timesteps, 3 dims each)
+    # Format: [pos_x, pos_y, pos_z]
     test_obs = np.array([
-        [0.5, 0.6, 0.0, 0.0, 0.0, 0.0, 0.08],  # Timestep t-1
-        [0.5, 0.6, 0.0, 0.0, 0.0, 0.0, 0.08],  # Timestep t (current)
+        [0.25095563, 0.39541559, 0.21994509],  # Timestep t-1
+        [0.25095563, 0.39541559, 0.21994509],  # Timestep t (current)
     ], dtype=np.float32)
     
     print("Test input (2 timesteps of observations):")
     print(f"  Position: [{test_obs[1, 0]:.3f}, {test_obs[1, 1]:.3f}, {test_obs[1, 2]:.3f}]")
-    print(f"  Rotation: [{test_obs[1, 3]:.3f}, {test_obs[1, 4]:.3f}, {test_obs[1, 5]:.3f}]")
-    print(f"  Gripper: {test_obs[1, 6]:.3f}")
     print()
     
     # Prepare input
     obs_dict = {
-        'obs': torch.from_numpy(test_obs).unsqueeze(0)  # Add batch dimension [1, 2, 7]
+        'obs': torch.from_numpy(test_obs).unsqueeze(0).to(device)  # Add batch dimension [1, 2, 3]
     }
     
-    print("Running inference...")
+    # Warm up GPU (run twice to ensure CUDA is initialized)
+    print("Warming up GPU...")
+    with torch.no_grad():
+        _ = policy.predict_action(obs_dict)
+        _ = policy.predict_action(obs_dict)
+    print("✓ Warm-up complete (CUDA initialized)\n")
+    
+    # Reset the detailed timing flag so we see breakdown on warmed-up GPU
+    policy.model._printed_detailed_timing = False
+    
+    print("="*80)
+    print("RUNNING INFERENCE WITH DETAILED TIMING (After Warm-up)")
+    print("="*80)
+    
+    # Run once with detailed timing (now on warmed GPU)
+    start_time = time.time()
     with torch.no_grad():
         result = policy.predict_action(obs_dict)
+    inference_time = time.time() - start_time
+    
+    print()
+    print("="*80)
+    print("MODEL CONFIGURATION")
+    print("="*80)
+    print(f"num_inference_steps:      {policy.num_inference_steps}")
+    print(f"Expected U-Net time:      ~{policy.num_inference_steps * 0.7:.0f}-{policy.num_inference_steps * 1.5:.0f} ms")
+    print(f"                          ({policy.num_inference_steps} steps × 0.7-1.5 ms per step)")
+    print(f"FPS (single run):         {1.0/inference_time:.2f} Hz")
+    print()
     
     action = result['action'].cpu().numpy()[0]  # Remove batch dim
     
+    print()
     print(f"✓ Predicted actions ({action.shape[0]} steps):")
     print()
-    for i in range(min(5, action.shape[0])):  # Show first 5 steps
+    for i in range(action.shape[0]):  # Show first 5 steps
         print(f"  Step {i}:")
         print(f"    Position: [{action[i, 0]:.4f}, {action[i, 1]:.4f}, {action[i, 2]:.4f}]")
-        print(f"    Rotation: [{action[i, 3]:.4f}, {action[i, 4]:.4f}, {action[i, 5]:.4f}]")
-        print(f"    Gripper: {action[i, 6]:.4f}")
-    
-    if action.shape[0] > 5:
-        print(f"  ... ({action.shape[0] - 5} more steps)")
     
     return action
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        checkpoint_path = "../data/outputs/2025.10.15/18.00.22_train_simple_task_simple_task/checkpoints/latest.ckpt"
+        # checkpoint_path = "../data/outputs/2025.11.11/16.50.28_train_simple_task_simple_task/checkpoints/latest.ckpt"
+        checkpoint_path = "../data/outputs/2025.11.24/11.59.55_train_simple_task_simple_task/checkpoints/latest.ckpt"
         print(f"No checkpoint provided, using: {checkpoint_path}")
     else:
         checkpoint_path = sys.argv[1]
