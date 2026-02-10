@@ -141,6 +141,10 @@ def main():
         print("Example: python convert_camera_data.py ../data/collections_camera dataset.zarr.zip")
         sys.exit(1)
     
+    # Joint time offset: during inference, joint positions arrive before the image
+    # due to pipeline delays. Shift joint interpolation time to match inference behavior.
+    JOINT_TIME_OFFSET = -0.3  # seconds (joint comes 0.3s before image during inference)
+    
     collections_dir = pathlib.Path(sys.argv[1]).expanduser().absolute()
     output_path = pathlib.Path(sys.argv[2]).expanduser().absolute()
     
@@ -174,9 +178,12 @@ def main():
             cur_joint_qpos = read_zarr_v3_array(episode_path / 'cur_joint_qpos')  # (T_joint, N)
             cur_joint_qpos_times = read_zarr_v3_array(episode_path / 'cur_joint_qpos_times')  # (T_joint,)
             
-            # Interpolate joint positions to camera timestamps
+            # Interpolate joint positions to camera timestamps with offset
+            # During inference, joint positions come from before the image time
+            # due to pipeline delays, so we shift to match inference behavior
+            joint_target_times = image_times + JOINT_TIME_OFFSET
             cur_joint_qpos_interp = interpolate_to_timestamps(
-                cur_joint_qpos, cur_joint_qpos_times, image_times
+                cur_joint_qpos, cur_joint_qpos_times, joint_target_times
             )
             
             # Build episode data dict
