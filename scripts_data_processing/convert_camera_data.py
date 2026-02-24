@@ -11,6 +11,7 @@ python convert_camera_data.py /home/sulab1/Workspace/jerry/diffusion/data/collec
 
 import sys
 import os
+import argparse
 import pathlib
 import zarr
 import numpy as np
@@ -135,25 +136,129 @@ def interpolate_to_timestamps(data, data_times, target_times):
     return result
 
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python convert_camera_data.py <collections_dir> <output_path>")
-        print("Example: python convert_camera_data.py ../data/collections_camera dataset.zarr.zip")
+def nearest_to_timestamps(data, data_times, target_times):
+    """
+    Match data to target timestamps by picking the closest sample.
+    
+    Args:
+        data: (T_data, ...) array of data points
+        data_times: (T_data,) array of timestamps for data
+        target_times: (T_target,) array of target timestamps
+    
+    Returns:
+        (T_target, ...) array of nearest-matched data
+    """
+    indices = np.searchsorted(data_times, target_times, side='right') - 1
+    indices = np.clip(indices, 0, len(data_times) - 1)
+    # Check if the next index is actually closer
+    next_indices = np.clip(indices + 1, 0, len(data_times) - 1)
+    diff_left = np.abs(target_times - data_times[indices])
+    diff_right = np.abs(target_times - data_times[next_indices])
+    use_next = diff_right < diff_left
+    indices[use_next] = next_indices[use_next]
+    return data[indices]
+
+
+def sample_episodes_from_scenes(scenes_dir, total_count, seed=None):
+    """
+    Randomly sample episodes across scene directories (s1, s2, ..., sN),
+    guaranteeing at least one episode per scene and totalling exactly `total_count`.
+
+    Returns a list of episode paths.
+    """
+    rng = np.random.default_rng(seed)
+
+    scene_dirs = sorted(
+        [d for d in scenes_dir.iterdir() if d.is_dir() and d.name.startswith('s')],
+        key=lambda d: int(d.name[1:])
+    )
+    if not scene_dirs:
+        print(f"Error: no scene directories (s1, s2, ...) found in {scenes_dir}")
         sys.exit(1)
+
+    scene_episodes = {}
+    for sd in scene_dirs:
+        eps = sorted([e for e in sd.iterdir() if e.is_dir() and e.name.startswith('episode_')])
+        if not eps:
+            print(f"Warning: {sd.name} has no episodes, skipping")
+            continue
+        scene_episodes[sd.name] = eps
+
+    n_scenes = len(scene_episodes)
+    if total_count < n_scenes:
+        print(f"Error: requested {total_count} episodes but need at least {n_scenes} (one per scene)")
+        sys.exit(1)
+
+    max_total = sum(len(eps) for eps in scene_episodes.values())
+    if total_count > max_total:
+        print(f"Error: requested {total_count} episodes but only {max_total} available")
+        sys.exit(1)
+
+    # Start with 1 per scene, then distribute the remainder randomly
+    allocation = {name: 1 for name in scene_episodes}
+    remaining = total_count - n_scenes
+
+    # Build pool of (scene_name, available_extra) pairs for weighted sampling
+    while remaining > 0:
+        expandable = [(name, len(eps) - allocation[name])
+                      for name, eps in scene_episodes.items()
+                      if allocation[name] < len(eps)]
+        if not expandable:
+            break
+        weights = np.array([extra for _, extra in expandable], dtype=float)
+        weights /= weights.sum()
+        chosen_idx = rng.choice(len(expandable), p=weights)
+        allocation[expandable[chosen_idx][0]] += 1
+        remaining -= 1
+
+    # Sample the actual episodes
+    selected = []
+    for name, eps in scene_episodes.items():
+        n = allocation[name]
+        chosen = list(rng.choice(eps, size=n, replace=False))
+        selected.extend(chosen)
+
+    print(f"Sampled {len(selected)} episodes from {n_scenes} scenes:")
+    for name in sorted(scene_episodes.keys(), key=lambda n: int(n[1:])):
+        print(f"  {name}: {allocation[name]}/{len(scene_episodes[name])} episodes")
+
+    return sorted(selected)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convert camera data to replay buffer format.')
+    parser.add_argument('collections_dir', type=str,
+                        help='Path to collections directory with episode_* subdirs, '
+                             'or parent directory of scene folders (s1, s2, ...) when using --multi-scene')
+    parser.add_argument('output_path', type=str,
+                        help='Output path for the .zarr.zip replay buffer')
+    parser.add_argument('--no-crop', action='store_true',
+                        help='Keep full image resized to 224x224 instead of cropping bottom-right')
+    parser.add_argument('--no-latency', action='store_true',
+                        help='Skip time offset and use nearest-neighbor matching instead of interpolation')
+    parser.add_argument('--multi-scene', type=int, default=None, metavar='N',
+                        help='Sample N total episodes across scene dirs (s1..sN), at least 1 per scene')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for episode sampling in --multi-scene mode')
+    args = parser.parse_args()
     
     # Joint time offset: during inference, joint positions arrive before the image
     # due to pipeline delays. Shift joint interpolation time to match inference behavior.
     JOINT_TIME_OFFSET = -0.3  # seconds (joint comes 0.3s before image during inference)
     
-    collections_dir = pathlib.Path(sys.argv[1]).expanduser().absolute()
-    output_path = pathlib.Path(sys.argv[2]).expanduser().absolute()
+    collections_dir = pathlib.Path(args.collections_dir).expanduser().absolute()
+    output_path = pathlib.Path(args.output_path).expanduser().absolute()
     
     if not collections_dir.exists():
         print(f"Error: {collections_dir} does not exist")
         sys.exit(1)
     
-    # Get all episode zarr directories
-    episodes = sorted([d for d in collections_dir.iterdir() if d.is_dir() and d.name.startswith('episode_')])
+    if args.multi_scene is not None:
+        episodes = sample_episodes_from_scenes(collections_dir, args.multi_scene, seed=args.seed)
+    else:
+        episodes = sorted([d for d in collections_dir.iterdir() if d.is_dir() and d.name.startswith('episode_')])
+
     print(f"Found {len(episodes)} episodes")
     
     if len(episodes) == 0:
@@ -170,21 +275,23 @@ def main():
             images = read_zarr_v3_array(episode_path / 'images')  # (T_img, H, W, C)
             image_times = read_zarr_v3_array(episode_path / 'image_times')  # (T_img,)
             
-            # Crop to bottom right quadrant
             T, H, W, C = images.shape
-            images = images[:, H - 224:, W - 224 - 25: W - 25, :]  # Bottom right
+            if not args.no_crop:
+                images = images[:, H - 224:, W - 224 - 25: W - 25, :]
             
             # Read joint position data and timestamps
             cur_joint_qpos = read_zarr_v3_array(episode_path / 'cur_joint_qpos')  # (T_joint, N)
             cur_joint_qpos_times = read_zarr_v3_array(episode_path / 'cur_joint_qpos_times')  # (T_joint,)
             
-            # Interpolate joint positions to camera timestamps with offset
-            # During inference, joint positions come from before the image time
-            # due to pipeline delays, so we shift to match inference behavior
-            joint_target_times = image_times + JOINT_TIME_OFFSET
-            cur_joint_qpos_interp = interpolate_to_timestamps(
-                cur_joint_qpos, cur_joint_qpos_times, joint_target_times
-            )
+            if args.no_latency:
+                cur_joint_qpos_interp = nearest_to_timestamps(
+                    cur_joint_qpos, cur_joint_qpos_times, image_times
+                )
+            else:
+                joint_target_times = image_times + JOINT_TIME_OFFSET
+                cur_joint_qpos_interp = interpolate_to_timestamps(
+                    cur_joint_qpos, cur_joint_qpos_times, joint_target_times
+                )
             
             # Build episode data dict
             episode_data = {}
