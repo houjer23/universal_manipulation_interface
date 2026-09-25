@@ -3,8 +3,9 @@
 cd /home/sulab1/Workspace/jerry/diffusion/universal_manipulation_interface
 
 # Configuration variables
-DATASET_PATH="/home/sulab1/Workspace/jerry/diffusion/data/camera_dataset2.zarr.zip"
+DATASET_PATH="/home/sulab1/Workspace/jerry/diffusion/data/diff_place_50_2.zarr.zip"
 NO_CROP=false  # Set to true to use full image with ResNet instead of cropped + CLIP
+GPU=0
 
 # Initialize conda for bash
 eval "$(conda shell.bash hook)"
@@ -19,7 +20,7 @@ if [ "$NO_CROP" = true ]; then
 fi
 echo ""
 
-python train.py --config-dir=diffusion_policy/config --config-name=train_simple_task_image \
+CUDA_VISIBLE_DEVICES=$GPU python train.py --config-dir=diffusion_policy/config --config-name=train_simple_task_image \
     task.dataset.dataset_path="$DATASET_PATH" \
     $EXTRA_OVERRIDES
 
